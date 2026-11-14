@@ -8,6 +8,9 @@ import { all } from '../db.js';
 import { resolveMediaPayload } from '../upload.js';
 import { buildRoundBrief, prepareRoundBrief } from '../round_brief.js';
 import * as T from '../teaching.js';
+import { createRequire } from 'module';
+
+const require = createRequire(import.meta.url);
 
 /** Replays the stored response when the client retries with the same Idempotency-Key (no duplicate AI calls). */
 async function withIdempotency(ctx, fn) {
@@ -78,6 +81,10 @@ export function aiRoutes(r) {
 
   r.post('/patients/:id/notes', (ctx) => withIdempotency(ctx, () =>
     O.draftNote({ user: ctx.user, patient: authorizePatient(ctx.user, ctx.params.id), input: ctx.body })));
+
+  // Scribe: one dictation → structured note (keeps POST /notes field mode intact).
+  r.post('/patients/:id/notes/from-dictation', (ctx) => withIdempotency(ctx, () =>
+    O.draftNoteFromDictation({ user: ctx.user, patient: authorizePatient(ctx.user, ctx.params.id), input: ctx.body || {} })));
 
   r.post('/artifacts/:id/sections/:key/rewrite', (ctx) => {
     const artifact = authorizeArtifact(ctx.user, ctx.params.id);
