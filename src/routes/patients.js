@@ -6,6 +6,7 @@ import { toEnvelope, decideProblem } from '../ai/orchestrator.js';
 import { matchedReminders, ackReminder } from '../check_rules.js';
 import { today as todayFn } from '../util.js';
 import { ensurePatientChannel } from '../chat.js';
+import { isIdentityFact } from '../ai/validators.js';
 
 export function authorizeArtifact(user, id) {
   const row = get('SELECT * FROM artifacts WHERE id=?', id);
@@ -96,7 +97,15 @@ export function patientRoutes(r) {
     return {
       id: p.id, display_name: p.display_name, room: p.room, age_band: p.age_band, sex: p.sex, sort_order: p.sort_order,
       revision: p.revision, last_reviewed_revision: p.last_reviewed_revision, summary_state: summaryState(p.id),
-      plan_today: ctx.clinician_plan, problems: all("SELECT id,label,state,uncertainty FROM problems WHERE patient_id=? AND state!='rejected' ORDER BY created_at", p.id),
+      plan_today: ctx.clinician_plan,
+      problems: all(
+        "SELECT id,label,state,fact_ids,uncertainty,code_suggestion FROM problems WHERE patient_id=? AND state!='rejected' ORDER BY created_at",
+        p.id,
+      ).map((x) => ({
+        ...x,
+        fact_ids: jsonParse(x.fact_ids, []),
+        code_suggestion: jsonParse(x.code_suggestion, null),
+      })),
       missing_information: ctx.missing_information, trends: ctx.trends, conflicts: ctx.conflicts,
       tasks: all("SELECT id,text,owner,due,state FROM tasks WHERE patient_id=? AND state IN ('proposed','open') ORDER BY created_at", p.id),
     };
@@ -123,7 +132,7 @@ export function patientRoutes(r) {
   r.get('/patients/:id/facts', ({ user, params, query }) => {
     authorizePatient(user, params.id);
     const status = ['pending', 'confirmed', 'rejected'].includes(query.status) ? query.status : null;
-    return all(`SELECT id,label,value,unit,event_time,source_id,assertion,reviewer_status FROM facts WHERE patient_id=? ${status ? 'AND reviewer_status=?' : ''} ORDER BY COALESCE(event_time,'') , created_at`, ...(status ? [params.id, status] : [params.id]));
+    return all(`SELECT id,label,value,unit,event_time,source_id,source_passage,assertion,reviewer_status FROM facts WHERE patient_id=? ${status ? 'AND reviewer_status=?' : ''} ORDER BY COALESCE(event_time,'') , created_at`, ...(status ? [params.id, status] : [params.id]));
   });
 
   // Manual entry by a clinician is confirmed immediately and is its own source.
@@ -132,6 +141,7 @@ export function patientRoutes(r) {
     const label = str(body.label, 120);
     const value = str(body.value, 1000);
     need(label && value, 400, 'fact_required', 'label and value are required');
+    need(!isIdentityFact(label, value), 400, 'identity_fact_excluded', 'Patient name, MRN, visit date, and other identity fields cannot be stored as clinical facts.');
     const eventTime = body.event_time ? str(body.event_time, 25) : null;
     need(!eventTime || isIsoDate(eventTime), 400, 'bad_time', 'event_time must be ISO date/time');
     const assertion = ['present', 'negated', 'uncertain'].includes(body.assertion) ? body.assertion : 'present';
@@ -157,15 +167,26 @@ export function patientRoutes(r) {
     need(ids.length, 400, 'ids_required', 'fact_ids required');
     const rev = tx(() => {
       let touched = 0;
+      let rejectedIdentity = 0;
       for (const id of ids) {
         const f = get('SELECT * FROM facts WHERE id=? AND patient_id=?', id, p.id);
         if (!f || f.reviewer_status === status) continue;
+        // Never promote identity/demographics into confirmed chart facts.
+        if (status === 'confirmed' && isIdentityFact(f.label, f.value)) {
+          run("UPDATE facts SET reviewer_status='rejected' WHERE id=?", id);
+          rejectedIdentity += 1;
+          touched += 1;
+          continue;
+        }
         touched += 1;
         run('UPDATE facts SET reviewer_status=? WHERE id=?', status, id);
       }
       if (!touched) return p.revision;
       const newRev = bumpRevision(p.id);
       for (const id of ids) run("UPDATE facts SET revision=? WHERE id=? AND patient_id=? AND reviewer_status='confirmed'", newRev, id, p.id);
+      if (rejectedIdentity) {
+        audit(user.id, 'fact_identity_auto_rejected', { patient_id: p.id, detail: { count: rejectedIdentity } });
+      }
       return newRev;
     });
     audit(user.id, `fact_${status}`, { patient_id: p.id, detail: { count: ids.length } });

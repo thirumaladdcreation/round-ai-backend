@@ -74,7 +74,7 @@ const ops = {
     const findSpan = (needle) => {
       const i = t.toLowerCase().indexOf(String(needle).toLowerCase());
       if (i < 0) return null;
-      return { start: i, end: i + needle.length };
+      return { start: i, end: i + String(needle).length };
     };
     const spanFor = (re, fallbackText) => {
       const m = t.match(re);
@@ -82,11 +82,33 @@ const ops = {
       const sp = findSpan(phrase);
       return sp ? { text: phrase.replace(/\bum\b|\buh\b|\bhad a\s+/gi, '').replace(/\s+/g, ' ').trim(), spans: [sp] } : null;
     };
+    const cleanSentence = (raw) => String(raw || '')
+      .replace(/\bum\b|\buh\b|\bhad a\s+/gi, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .replace(/^[.]+|[.]+$/g, '');
     const needs = [];
     if (/ICU console/i.test(t)) {
       const sp = findSpan('ICU console was placed') || findSpan('ICU console');
       if (sp) needs.push({ phrase: t.slice(sp.start, sp.end), question: 'What was placed?', spans: [sp] });
     }
+
+    // Generic fallback: split transcript into clinical sentences with real spans so
+    // any dictated update (not only the fever/IVF demo phrases) yields a usable draft.
+    const generic = { subjective: [], exam: [], plan: [] };
+    const planRe = /\b(plan|assessment|continue|start|stop|discontinue|increase|decrease|follow\s*up|check labs|ivf|antibiotics?|diuresis)\b/i;
+    const examRe = /\b(exam|abdomen|lungs?|heart|extremit|soft|nontender|bilaterally|alert|oriented)\b/i;
+    for (const raw of splitSentences(t)) {
+      const cleaned = cleanSentence(raw);
+      if (cleaned.length < 3) continue;
+      const sp = findSpan(raw) || findSpan(cleaned);
+      if (!sp) continue;
+      const item = { text: cleaned, spans: [sp], fact_ids: [] };
+      if (planRe.test(cleaned)) generic.plan.push(item);
+      else if (examRe.test(cleaned)) generic.exam.push(item);
+      else generic.subjective.push(item);
+    }
+
     const sections = template.sections.map((s) => {
       const sentences = [];
       if (s.source === 'clinician_subjective' || s.key === 'hpi' || s.key === 'interval_events') {
@@ -99,16 +121,19 @@ const ops = {
         for (const x of [fever, noCp, chills, skinny && { text: 'very skinny', spans: skinny.spans }, denies, uo]) {
           if (x?.text && x.spans?.length) sentences.push({ ...x, fact_ids: [] });
         }
+        if (!sentences.length) sentences.push(...generic.subjective);
       }
       if (s.source === 'clinician_exam' || s.key === 'exam') {
         const soft = spanFor(/soft abdomen nontender/i, 'soft abdomen nontender');
         const lungs = spanFor(/lungs clear bilaterally/i, 'lungs clear bilaterally');
         for (const x of [soft, lungs]) if (x) sentences.push({ ...x, fact_ids: [] });
+        if (!sentences.length) sentences.push(...generic.exam);
       }
       if (s.source === 'clinician_plan' || s.key === 'assessment_plan') {
         const plan = spanFor(/continue IVF and check labs|plan continue IVF[^.]*/i, 'continue IVF and check labs');
         // Intentionally skip inventing a plan when none is in the transcript.
         if (plan && /plan|IVF|labs/i.test(t)) sentences.push({ ...plan, fact_ids: [] });
+        if (!sentences.length) sentences.push(...generic.plan);
       }
       if (s.source === 'facts' || s.source === 'facts_and_exam') {
         const creat = context.facts.find((f) => /creatinine/i.test(`${f.label} ${f.value}`));
@@ -119,6 +144,12 @@ const ops = {
         if (/INVENT_BP_99/.test(t) && (s.source === 'facts_and_exam' || s.key === 'objective')) {
           const sp = findSpan('fever') || { start: 0, end: Math.min(5, t.length) };
           sentences.push({ text: 'Blood pressure 99/50', spans: [sp], fact_ids: [] });
+        }
+        // Exam lines from dictation may also feed facts_and_exam sections.
+        if (s.source === 'facts_and_exam' && generic.exam.length) {
+          for (const x of generic.exam) {
+            if (!sentences.some((y) => y.text === x.text)) sentences.push(x);
+          }
         }
       }
       return { key: s.key, sentences };

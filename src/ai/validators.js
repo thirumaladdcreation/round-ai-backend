@@ -27,6 +27,20 @@ export function makeChecker(ctx) {
   return { facts, claims, allowedFor };
 }
 
+/** Identity / demographics / foreign chart headers must never become clinical facts. */
+const IDENTITY_LABEL = /\b(patient\s*name|full\s*name|name|dob|date\s*of\s*birth|mrn|medical\s*record|account\s*(#|number)|ssn|social\s*security|visit\s*date|admission\s*date|encounter\s*(id|number)|insurance|address|phone|next\s*of\s*kin)\b/i;
+const IDENTITY_VALUE = /\b(john\s*doe|jane\s*doe|dummy\s*patient|test\s*patient)\b/i;
+
+export function isIdentityFact(label, value) {
+  const l = String(label || '');
+  const v = String(value || '');
+  if (IDENTITY_LABEL.test(l)) return true;
+  if (IDENTITY_VALUE.test(v) || IDENTITY_VALUE.test(l)) return true;
+  // Bare calendar year as a "visit date" without clinical context.
+  if (/visit|admit|encounter/i.test(l) && /^\d{4}(-\d{2}(-\d{2})?)?$/.test(v.trim())) return true;
+  return false;
+}
+
 export function validateExtractFacts(raw, source, { lowLegibilityLines = [] } = {}) {
   const issues = [];
   const facts = [];
@@ -38,9 +52,13 @@ export function validateExtractFacts(raw, source, { lowLegibilityLines = [] } = 
   for (const line of low) missing.push(`low_legibility: ${line.raw.slice(0, 200)}`);
   for (const f of Array.isArray(raw?.facts) ? raw.facts : []) {
     const label = typeof f?.label === 'string' ? f.label.trim().slice(0, 120) : '';
-    const value = typeof f?.value === 'string' || typeof f?.value === 'number' ? String(f.value).trim().slice(0, 1000) : '';
+    let value = typeof f?.value === 'string' || typeof f?.value === 'number' ? String(f.value).trim().slice(0, 1000) : '';
     const passage = typeof f?.source_passage === 'string' ? f.source_passage.trim() : '';
     if (!label || !value || !passage) { issues.push({ code: 'incomplete_fact' }); continue; }
+    if (isIdentityFact(label, value)) {
+      issues.push({ code: 'identity_fact_excluded', label });
+      continue;
+    }
     if (!text.includes(norm(passage))) { issues.push({ code: 'passage_not_in_source', label }); continue; }
     // Low-legibility lines must not become facts (checked before number rules so the reason is clear).
     if (low.some((l) => norm(passage).includes(l.n) || l.n.includes(norm(passage)))) {
@@ -48,6 +66,13 @@ export function validateExtractFacts(raw, source, { lowLegibilityLines = [] } = 
       continue;
     }
     if (unsupportedNumbers(value, passage).length) { issues.push({ code: 'value_not_in_passage', label }); continue; }
+    // Keep oxygen device / FiO2 context with SpO2 values when present in the passage.
+    if (/spo2|o2 sat|oxygen sat|oxygenation/i.test(label) || (/^\d+(\.\d+)?$/.test(value) && /spo2|o2 sat/i.test(passage))) {
+      const o2ctx = passage.match(/\b(?:on\s+)?(?:room air|RA|\d+\s*L(?:\/min)?(?:\s*(?:NC|nasal cannula))?|high[- ]flow|BiPAP|CPAP|ventilator|FiO2\s*\d+%?)\b/i);
+      if (o2ctx && !new RegExp(o2ctx[0].replace(/\s+/g, '\\s+'), 'i').test(value)) {
+        value = `${value} (${o2ctx[0]})`.slice(0, 1000);
+      }
+    }
     facts.push({
       label, value, unit: typeof f.unit === 'string' ? f.unit.trim().slice(0, 20) : '',
       event_time: isIsoDate(f.event_time) ? f.event_time : source.event_time || null,

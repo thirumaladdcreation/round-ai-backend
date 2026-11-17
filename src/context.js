@@ -21,14 +21,32 @@ export function computeTrends(facts) {
     const a = list[0];
     const b = list[list.length - 1];
     const delta = Math.round((Number(b.value) - Number(a.value)) * 1000) / 1000;
+    const direction = delta > 0 ? 'rose' : delta < 0 ? 'fell' : 'unchanged';
+    const unit = b.unit || '';
+    const verb = direction === 'rose' ? 'increased' : direction === 'fell' ? 'decreased' : 'unchanged';
+    const text = verb === 'unchanged'
+      ? `${b.label} unchanged at ${b.value}${unit ? ` ${unit}` : ''}`
+      : `${b.label} ${verb} from ${a.value} to ${b.value}${unit ? ` ${unit}` : ''}`;
     out.push({
-      label: b.label, unit: b.unit || '',
+      label: b.label, unit,
       from: { value: a.value, event_time: a.event_time, fact_id: a.fact_id },
       to: { value: b.value, event_time: b.event_time, fact_id: b.fact_id },
-      delta: String(delta), direction: delta > 0 ? 'rose' : delta < 0 ? 'fell' : 'unchanged',
+      delta: String(delta), direction, text,
     });
   }
   return out;
+}
+
+function conflictSources(a, b) {
+  const parts = [];
+  for (const f of [a, b]) {
+    if (!f) continue;
+    const passage = String(f.source_passage || '').trim().slice(0, 160);
+    const when = f.event_time || 'unknown time';
+    if (passage) parts.push(`“${passage}” (${when})`);
+    else parts.push(`${f.label} ${f.value}${f.unit ? ` ${f.unit}` : ''} (${when})`);
+  }
+  return parts.join(' vs ');
 }
 
 /** Same measurement, same time, different values; or present vs negated on the same day. */
@@ -41,13 +59,26 @@ export function detectConflicts(facts) {
     if (isNum(f.value) && f.event_time) {
       const prev = seen.get(k1);
       if (prev && prev.value !== f.value) {
-        out.push({ type: 'value_conflict', text: `${f.label} has different values at the same time (${prev.value} vs ${f.value}).`, fact_ids: [prev.fact_id, f.fact_id] });
+        out.push({
+          type: 'value_conflict',
+          label: f.label,
+          text: `${f.label} has different values at the same time (${prev.value} vs ${f.value}).`,
+          sources_text: conflictSources(prev, f),
+          fact_ids: [prev.fact_id, f.fact_id],
+        });
       } else seen.set(k1, f);
     }
     const k2 = `${f.label.toLowerCase()}|${day}|${f.assertion === 'negated' ? 'neg' : f.assertion === 'present' ? 'pos' : 'unc'}`;
     const opposite = `${f.label.toLowerCase()}|${day}|${f.assertion === 'negated' ? 'pos' : 'neg'}`;
     if (day && seen.has(opposite) && f.assertion !== 'uncertain') {
-      out.push({ type: 'assertion_conflict', text: `${f.label} is documented as both present and absent on ${day}.`, fact_ids: [seen.get(opposite).fact_id, f.fact_id] });
+      const other = seen.get(opposite);
+      out.push({
+        type: 'assertion_conflict',
+        label: f.label,
+        text: `${f.label} is documented as both present and absent on ${day}.`,
+        sources_text: conflictSources(other, f),
+        fact_ids: [other.fact_id, f.fact_id],
+      });
     }
     seen.set(k2, f);
   }

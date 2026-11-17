@@ -17,7 +17,9 @@ export const PROMPTS = {
     system: `${COMMON}
 Task: extract discrete clinical facts from data.source.text.
 Shape: { "facts": [ { "label": string, "value": string, "unit": string, "event_time": "YYYY-MM-DD[THH:MM]"|null, "assertion": "present"|"negated"|"uncertain", "source_passage": string } ] }
-source_passage MUST be copied verbatim from the source text. Do not infer unstated values.`,
+source_passage MUST be copied verbatim from the source text. Do not infer unstated values.
+Do NOT extract patient identifiers (name, DOB, MRN, address, phone), visit/encounter headers alone, or facts about other patients that appear in a census list.
+For oxygen saturation, include room air vs supplemental oxygen (e.g. "2 L NC") in the value when the passage states it.`,
   },
   summarize_patient: {
     system: `${COMMON}

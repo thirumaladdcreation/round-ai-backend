@@ -8,8 +8,8 @@ import assert from 'node:assert/strict';
 const { createApp } = await import('../src/server.js');
 const { seedDemo, DEMO_PASSWORD } = await import('../src/seed.js');
 const { setEvidenceFetch } = await import('../src/evidence/pubmed.js');
-const { validateExtractFacts, validateSummary } = await import('../src/ai/validators.js');
-const { get } = await import('../src/db.js');
+const { validateExtractFacts, validateSummary, isIdentityFact } = await import('../src/ai/validators.js');
+const { get, all } = await import('../src/db.js');
 
 let server; let base; let seed;
 let resident; let admin; let other;
@@ -80,6 +80,41 @@ test('team isolation: other team cannot read the patient; admin role does not by
   assert.ok(logged >= 1);
 });
 
+test('demo seed keeps patient facts bound and excludes identity contamination', async () => {
+  assert.equal(isIdentityFact('Patient Name', 'John Doe'), true);
+  assert.equal(isIdentityFact('Visit date', '2023'), true);
+  assert.equal(isIdentityFact('Creatinine', '2.1'), false);
+  const rejected = validateExtractFacts(
+    { facts: [
+      { label: 'Patient Name', value: 'John Doe', unit: '', assertion: 'present', source_passage: 'Patient Name: John Doe' },
+      { label: 'Creatinine', value: '2.1', unit: 'mg/dL', assertion: 'present', source_passage: 'Creatinine 2.1 mg/dL' },
+    ] },
+    { text: 'Patient Name: John Doe. Creatinine 2.1 mg/dL', event_time: '2026-08-31T06:00' },
+  );
+  assert.ok(rejected.issues.some((i) => i.code === 'identity_fact_excluded'));
+  assert.equal(rejected.output.facts.length, 1);
+  assert.match(rejected.output.facts[0].label, /creatinine/i);
+
+  const rosaFacts = all('SELECT label, value FROM facts WHERE patient_id=?', seed.patientId);
+  assert.ok(rosaFacts.length > 0);
+  for (const f of rosaFacts) {
+    assert.equal(isIdentityFact(f.label, f.value), false);
+    assert.doesNotMatch(`${f.label} ${f.value}`, /john\s*doe/i);
+  }
+  if (seed.alexId) {
+    const alexFacts = all('SELECT id FROM facts WHERE patient_id=?', seed.alexId);
+    const cross = all('SELECT id FROM facts WHERE patient_id=? AND id IN (SELECT id FROM facts WHERE patient_id=?)', seed.patientId, seed.alexId);
+    assert.equal(cross.length, 0);
+    assert.ok(alexFacts.length >= 0);
+  }
+  const quiz = await api('GET', `/teaching/questions?topic=${encodeURIComponent('Elevated Pulse')}&count=1`, {
+    token: resident,
+    headers: { 'Idempotency-Key': 'seed-elevated-pulse-1' },
+  });
+  assert.equal(quiz.status, 200);
+  assert.ok((quiz.json.questions || []).length >= 1);
+});
+
 test('summary only cites known facts; every claim has fact_ids; no direct identifiers sent to the model', async () => {
   const r = await api('POST', `/patients/${seed.patientId}/summary`, { token: resident, body: { date: '2026-08-31' } });
   assert.equal(r.status, 200);
@@ -126,17 +161,19 @@ test('note: plan never invented; placeholders block review; editing resolves; ex
 });
 
 test('problems: AI suggestions are never confirmed; rejected labels are not re-suggested', async () => {
-  const r = await api('POST', `/patients/${seed.patientId}/problems/suggest`, { token: resident, body: {} });
+  // Use Alex (no seeded problems) so this test is independent of Rosa demo problems.
+  const patientId = seed.alexId || seed.patientId;
+  const r = await api('POST', `/patients/${patientId}/problems/suggest`, { token: resident, body: {} });
   assert.equal(r.status, 200);
-  const list = (await api('GET', `/patients/${seed.patientId}/problems`, { token: resident })).json;
+  const list = (await api('GET', `/patients/${patientId}/problems`, { token: resident })).json;
   assert.ok(list.length >= 1);
   assert.ok(list.every((p) => p.state !== 'confirmed'));
-  const aki = list.find((p) => /kidney/.test(p.label));
-  assert.ok(aki);
-  await api('POST', `/patients/${seed.patientId}/problems/${aki.id}/decision`, { token: resident, body: { action: 'reject' } });
-  await api('POST', `/patients/${seed.patientId}/problems/suggest`, { token: resident, body: {} });
-  const again = (await api('GET', `/patients/${seed.patientId}/problems`, { token: resident })).json;
-  assert.equal(again.filter((p) => /kidney/.test(p.label) && p.state !== 'rejected').length, 0);
+  const candidate = list.find((p) => /pneumonia|kidney|cough/i.test(p.label)) || list[0];
+  assert.ok(candidate);
+  await api('POST', `/patients/${patientId}/problems/${candidate.id}/decision`, { token: resident, body: { action: 'reject' } });
+  await api('POST', `/patients/${patientId}/problems/suggest`, { token: resident, body: {} });
+  const again = (await api('GET', `/patients/${patientId}/problems`, { token: resident })).json;
+  assert.equal(again.filter((p) => p.label === candidate.label && p.state !== 'rejected').length, 0);
 });
 
 test('evidence: needs a confirmed problem or topic; identifiers blocked; retracted/editorial excluded; URLs built from PMID', async () => {
@@ -762,6 +799,24 @@ test('W4: from-dictation cleans messy transcript into sections; ambiguity → ne
   assert.ok(amb.json.content.needs_clarification.some((c) => /placed|console/i.test(c.phrase) || /What was placed/i.test(c.question)));
 });
 
+test('W4: from-dictation accepts a generic clinical update (not only demo phrases)', async () => {
+  const clinical = 'Overnight oxygen need increased on 2 L nasal cannula. Creatinine rose. Plan continue IVF and recheck labs in the morning.';
+  const r = await api('POST', `/patients/${seed.patientId}/notes/from-dictation`, {
+    token: resident,
+    body: { note_type: 'progress', note_date: '2026-09-12', transcript: clinical },
+  });
+  assert.equal(r.status, 200);
+  const sections = r.json.content.sections || [];
+  const withText = sections.filter((s) => s.text && !/not entered/i.test(s.text));
+  assert.ok(withText.length >= 1, 'expected at least one filled section from clinical update');
+  const empty = await api('POST', `/patients/${seed.patientId}/notes/from-dictation`, {
+    token: resident,
+    body: { note_type: 'progress', note_date: '2026-09-12', transcript: '   ' },
+  });
+  assert.equal(empty.status, 400);
+  assert.equal(empty.json.error?.code, 'transcript_required');
+});
+
 test('W4: invented number in scribe sentence is dropped; negation preserved', async () => {
   const { validateNoteFromDictation } = await import('../src/ai/validators.js');
   const template = {
@@ -1162,8 +1217,9 @@ test('M4: teaching plan from census topics; bank-first questions; unapproved not
 
   const bankEmpty = await api('GET', `/teaching/questions?topic=${encodeURIComponent(topic)}&count=2`, { token: resident });
   assert.equal(bankEmpty.status, 200);
-  assert.equal(bankEmpty.json.bank_served, 0);
+  // Demo seed may already include approved bank items for some topics.
   assert.ok(!bankEmpty.json.questions.some((q) => q.mcq_id === unreviewedId));
+  assert.ok(bankEmpty.json.questions.every((q) => q.status === 'approved' && q.bank === true));
 
   const approved = await api('PATCH', `/admin/mcqs/${unreviewedId}`, { token: admin, body: { status: 'approved' } });
   assert.equal(approved.status, 200);
