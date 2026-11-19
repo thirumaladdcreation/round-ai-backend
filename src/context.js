@@ -1,6 +1,7 @@
 import { all, get, run } from './db.js';
 import { config } from './config.js';
 import { jsonParse, today } from './util.js';
+import { planTextForContext } from './plan.js';
 
 const isNum = (v) => /^-?\d+(\.\d+)?$/.test(String(v).trim());
 const timeKey = (f) => f.event_time || '';
@@ -104,10 +105,19 @@ export function buildContext(patient, { date = today() } = {}) {
   const truncated = rows.length > max;
   const kept = rows.slice(0, max).reverse().map(mapFact); // oldest -> newest
   const plan = get('SELECT * FROM plans WHERE patient_id=? AND plan_date=? ORDER BY created_at DESC LIMIT 1', patient.id, date);
-  const problems = all("SELECT id,label,state,fact_ids,uncertainty FROM problems WHERE patient_id=? AND state IN ('confirmed','differential') ORDER BY created_at", patient.id)
-    .map((p) => ({ ...p, fact_ids: jsonParse(p.fact_ids, []) }));
+  const problems = all(
+    "SELECT id,label,state,fact_ids,uncertainty,code_suggestion FROM problems WHERE patient_id=? AND state IN ('confirmed','differential') ORDER BY created_at",
+    patient.id,
+  ).map((p) => ({
+    ...p,
+    fact_ids: jsonParse(p.fact_ids, []),
+    code_suggestion: jsonParse(p.code_suggestion, null),
+  }));
+  const resolved = plan
+    ? planTextForContext(plan, { problems })
+    : { text: '', plan_date: null, structured: null, include_icd: false };
   const missing = [];
-  if (!plan) missing.push('clinician_plan');
+  if (!resolved.text) missing.push('clinician_plan');
   if (unreviewed > 0) missing.push(`${unreviewed} extracted fact(s) not yet reviewed (excluded)`);
   if (kept.some((f) => f.event_time === 'Unknown')) missing.push('some facts have no event time');
   if (kept.length === 0) missing.push('no reviewed chart facts');
@@ -119,7 +129,14 @@ export function buildContext(patient, { date = today() } = {}) {
     selected_date: date,
     context_revision: patient.revision,
     facts: kept,
-    clinician_plan: plan ? { text: plan.text, plan_date: plan.plan_date } : null,
+    clinician_plan: resolved.text
+      ? {
+          text: resolved.text,
+          plan_date: resolved.plan_date,
+          include_icd: resolved.include_icd,
+          structured: resolved.structured,
+        }
+      : null,
     problems,
     trends: computeTrends(kept),
     conflicts: detectConflicts(kept),

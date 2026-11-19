@@ -9,7 +9,7 @@ const { createApp } = await import('../src/server.js');
 const { seedDemo, DEMO_PASSWORD } = await import('../src/seed.js');
 const { setEvidenceFetch } = await import('../src/evidence/pubmed.js');
 const { validateExtractFacts, validateSummary, isIdentityFact } = await import('../src/ai/validators.js');
-const { get, all } = await import('../src/db.js');
+const { get, all, run } = await import('../src/db.js');
 
 let server; let base; let seed;
 let resident; let admin; let other;
@@ -113,6 +113,54 @@ test('demo seed keeps patient facts bound and excludes identity contamination', 
   });
   assert.equal(quiz.status, 200);
   assert.ok((quiz.json.questions || []).length >= 1);
+  const q0 = quiz.json.questions[0];
+  const optCount = Array.isArray(q0.options)
+    ? q0.options.length
+    : Object.keys(q0.options || {}).length;
+  assert.equal(optCount, 5);
+});
+
+test('structured Assessment and Plan: save/load; ICD toggle preserves wording', async () => {
+  const detail = (await api('GET', `/patients/${seed.patientId}`, { token: resident })).json;
+  const problems = detail.problems || [];
+  const aki = problems.find((p) => /kidney/i.test(p.label));
+  const cap = problems.find((p) => /pneumonia/i.test(p.label));
+  assert.ok(aki && cap);
+  const items = [
+    {
+      problem_id: cap.id,
+      label: cap.label,
+      assessment: 'Hospital day 3 CAP; cultures pending.',
+      plan: 'Continue ceftriaxone; follow cultures.',
+    },
+    {
+      problem_id: aki.id,
+      label: aki.label,
+      assessment: 'Creatinine increased from 0.9 to 2.1 mg/dL.',
+      plan: 'Hold nephrotoxins; recheck creatinine.',
+    },
+  ];
+  const off = await api('PUT', `/patients/${seed.patientId}/plan`, {
+    token: resident,
+    body: { items, include_icd: false, plan_date: '2026-09-12' },
+  });
+  assert.equal(off.status, 200);
+  assert.equal(off.json.plan_structured?.include_icd, false);
+  assert.doesNotMatch(off.json.plan_today.text, /\(N17\.9\)|\(J18\.9\)/);
+  assert.match(off.json.plan_today.text, /Creatinine increased from 0\.9 to 2\.1/);
+
+  const on = await api('PUT', `/patients/${seed.patientId}/plan`, {
+    token: resident,
+    body: { items, include_icd: true, plan_date: '2026-09-12' },
+  });
+  assert.equal(on.status, 200);
+  assert.equal(on.json.plan_structured?.include_icd, true);
+  assert.match(on.json.plan_today.text, /N17\.9|J18\.9/);
+  assert.match(on.json.plan_today.text, /Creatinine increased from 0\.9 to 2\.1/);
+
+  const again = (await api('GET', `/patients/${seed.patientId}`, { token: resident })).json;
+  assert.ok(again.plan_structured?.items?.length >= 2);
+  assert.match(again.plan_today.text, /Creatinine increased/);
 });
 
 test('summary only cites known facts; every claim has fact_ids; no direct identifiers sent to the model', async () => {
@@ -696,6 +744,8 @@ test('M2c: coding suggest uses local candidates; bogus model codes dropped; acce
   assert.ok(r.json.content.validation_issues.some((i) => i.code === 'code_not_in_candidates'));
   assert.equal(r.json.content.stored_on_problem, false);
 
+  // Rosa seed may already attach an accepted demo code; clear so accept path is measurable.
+  run('UPDATE problems SET code_suggestion=NULL WHERE id=?', target.id);
   const before = (await api('GET', `/patients/${seed.patientId}/problems`, { token: resident })).json.find((p) => p.id === target.id);
   assert.equal(before.code_suggestion, null);
 

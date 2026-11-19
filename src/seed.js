@@ -23,35 +23,182 @@ const ALEX_SOURCES = [
   { kind: 'admission_note', title: 'Admission note', event_time: '2026-08-30T10:00', text: '52-year-old man admitted with community-acquired pneumonia. Productive cough for three days. SpO2 94% on room air. Temperature 38.1 C.' },
 ];
 
-/** Backfill approved Elevated Pulse questions on already-seeded DBs. */
-function ensureElevatedPulseBank() {
-  const key = topicKey('Elevated Pulse');
-  const existing = get("SELECT COUNT(*) AS n FROM mcqs WHERE topic_key=? AND status='approved'", key);
-  if (existing?.n > 0) return;
-  const admin = get("SELECT id FROM users WHERE role='admin' LIMIT 1");
-  if (!admin) return;
-  const now = nowIso();
+const ELEVATED_PULSE_OPTIONS = [
+  'Volume status and oxygen delivery before attributing tachycardia to infection alone',
+  'Immediate cardioversion for presumed unstable SVT',
+  'Stopping antibiotics to reduce drug fever',
+  'Ignoring pulse until blood cultures return',
+  'Ordering an echocardiogram before examining the patient at the bedside',
+];
+const ELEVATED_PULSE_EXPLANATIONS = [
+  'Tachycardia with rising oxygen need and falling urine output warrants volume and gas-exchange assessment; the pulse is a clue, not a diagnosis.',
+  'Cardioversion is for unstable arrhythmia with clear criteria, not the first step from this vignette alone.',
+  'Antibiotics are treating pneumonia; stopping them is not indicated for this finding.',
+  'Pending cultures do not justify ignoring a new vital-sign change.',
+  'Imaging can wait until bedside volume and oxygen delivery are assessed.',
+];
+
+function seedElevatedPulseMcqs({ adminId, now }) {
   seedApprovedMcq({
-    adminId: admin.id,
+    adminId,
     topic: 'Elevated Pulse',
     vignette: 'A 68-year-old woman with community-acquired pneumonia develops SpO2 88% on room air overnight and is placed on 2 L nasal cannula. Pulse is 112 bpm. Creatinine has risen from 0.9 to 1.8 mg/dL with low urine output.',
     question: 'Which next bedside assessment best clarifies the tachycardia in this context?',
+    options: ELEVATED_PULSE_OPTIONS,
+    correctIndex: 0,
+    explanations: ELEVATED_PULSE_EXPLANATIONS,
+    now,
+  });
+  seedApprovedMcq({
+    adminId,
+    topic: 'Elevated Pulse',
+    vignette: 'Same patient: pulse 112 bpm on 2 L nasal cannula after overnight desaturation to SpO2 88% on room air. Blood pressure is stable.',
+    question: 'Which statement best reflects how to teach this finding on rounds?',
     options: [
-      'Volume status and oxygen delivery before attributing tachycardia to infection alone',
-      'Immediate cardioversion for presumed unstable SVT',
-      'Stopping antibiotics to reduce drug fever',
-      'Ignoring pulse until blood cultures return',
+      'Treat tachycardia as a sign to integrate gas exchange and volume, not a rhythm diagnosis by itself',
+      'Label SVT and cardiovert before examining the patient',
+      'Ignore until the discharge summary',
+      'Attribute solely to anxiety without vitals context',
+      'Assume drug fever from antibiotics without reviewing vitals',
     ],
     correctIndex: 0,
     explanations: [
-      'Tachycardia with rising oxygen need and falling urine output warrants volume and gas-exchange assessment; the pulse is a clue, not a diagnosis.',
-      'Cardioversion is for unstable arrhythmia with clear criteria, not the first step from this vignette alone.',
-      'Antibiotics are treating pneumonia; stopping them is not indicated for this finding.',
-      'Pending cultures do not justify ignoring a new vital-sign change.',
+      'Teaching should connect the pulse to oxygen delivery and volume using the documented facts.',
+      'Cardioversion without instability criteria is not supported by this vignette.',
+      'A new vital-sign change belongs in today’s assessment.',
+      'Anxiety is not documented; do not invent unsupported explanations.',
+      'Drug fever is not established from this vignette alone.',
     ],
     now,
   });
-  console.log('Backfilled approved Elevated Pulse learning questions.');
+}
+
+/** Backfill approved Elevated Pulse questions on already-seeded DBs. */
+function ensureElevatedPulseBank() {
+  const key = topicKey('Elevated Pulse');
+  const rows = all("SELECT id, content FROM mcqs WHERE topic_key=? AND status='approved' AND source='human'", key);
+  if (rows.length === 0) {
+    const admin = get("SELECT id FROM users WHERE role='admin' LIMIT 1");
+    if (!admin) return;
+    seedElevatedPulseMcqs({ adminId: admin.id, now: nowIso() });
+    console.log('Backfilled approved Elevated Pulse learning questions (5 options).');
+    return;
+  }
+  // Patch undersized seed content in place (keep ids so attempts stay valid).
+  for (const row of rows) {
+    let content;
+    try {
+      content = JSON.parse(row.content || '{}');
+    } catch {
+      content = {};
+    }
+    if (Array.isArray(content.options) && content.options.length >= 5) continue;
+    content.options = ELEVATED_PULSE_OPTIONS;
+    content.explanations = ELEVATED_PULSE_EXPLANATIONS;
+    if (!Number.isInteger(content.correct_index)) content.correct_index = 0;
+    run('UPDATE mcqs SET content=? WHERE id=?', JSON.stringify(content), row.id);
+  }
+}
+
+function seedRosaStructuredPlan({ patientId, adminId, now }) {
+  const aki = get("SELECT id FROM problems WHERE patient_id=? AND label='acute kidney injury'", patientId);
+  const cap = get("SELECT id FROM problems WHERE patient_id=? AND label='community-acquired pneumonia'", patientId);
+  const pulse = get("SELECT id FROM problems WHERE patient_id=? AND label='Elevated Pulse'", patientId);
+  const structured = {
+    version: 1,
+    include_icd: false,
+    items: [
+      {
+        problem_id: cap?.id || null,
+        label: 'community-acquired pneumonia',
+        assessment: 'Hospital day 3 for community-acquired pneumonia; cultures pending.',
+        plan: 'Continue ceftriaxone and azithromycin; follow blood cultures.',
+        code: null,
+      },
+      {
+        problem_id: aki?.id || null,
+        label: 'acute kidney injury',
+        assessment: 'Creatinine increased from 0.9 to 2.1 mg/dL with low urine output.',
+        plan: 'Hold nephrotoxins; recheck creatinine; assess volume status.',
+        code: null,
+      },
+      {
+        problem_id: pulse?.id || null,
+        label: 'Elevated Pulse',
+        assessment: 'Pulse 112 bpm with rising oxygen need after SpO2 88% on room air.',
+        plan: 'Correlate with oxygen delivery and volume before attributing to fever alone.',
+        code: null,
+      },
+    ],
+  };
+  run(
+    'INSERT INTO plans(id,patient_id,plan_date,text,author_id,revision,created_at) VALUES(?,?,?,?,?,?,?)',
+    uid(),
+    patientId,
+    now.slice(0, 10),
+    JSON.stringify(structured),
+    adminId,
+    1,
+    now,
+  );
+}
+
+/**
+ * Idempotent: ensure Rosa fictional case exists on an already-seeded DB without wiping users.
+ * Does not delete other patients' data.
+ */
+export async function ensureRosaDemoCase() {
+  const team = get("SELECT id FROM teams WHERE name LIKE '%Team A%' LIMIT 1")
+    || get('SELECT id FROM teams LIMIT 1');
+  const admin = get("SELECT id FROM users WHERE role='admin' LIMIT 1");
+  if (!team || !admin) return null;
+  const now = nowIso();
+  let rosa = get("SELECT * FROM patients WHERE display_name LIKE 'Rosa Martinez%' LIMIT 1");
+  if (!rosa) {
+    const id = uid();
+    run(
+      'INSERT INTO patients(id,team_id,display_name,room,age_band,sex,sort_order,revision,created_at) VALUES(?,?,?,?,?,?,?,1,?)',
+      id, team.id, 'Rosa Martinez (fictional)', '509A', '60s', 'female', 10, now,
+    );
+    rosa = get('SELECT * FROM patients WHERE id=?', id);
+    ensurePatientChannel({ patient: rosa, createdBy: admin.id });
+    await seedPatientFacts({ patientId: id, sources: ROSA_SOURCES, now });
+  }
+  const patientId = rosa.id;
+  const ensureProblem = (label, codePayload) => {
+    let row = get('SELECT * FROM problems WHERE patient_id=? AND label=?', patientId, label);
+    if (!row) {
+      run(
+        `INSERT INTO problems(id,patient_id,label,state,fact_ids,uncertainty,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)`,
+        uid(), patientId, label, 'confirmed', '[]', '', now, now,
+      );
+      row = get('SELECT * FROM problems WHERE patient_id=? AND label=?', patientId, label);
+    }
+    if (codePayload && !row.code_suggestion) {
+      run('UPDATE problems SET code_suggestion=? WHERE id=?', JSON.stringify(codePayload), row.id);
+    }
+    return row;
+  };
+  ensureProblem('acute kidney injury', {
+    code: 'N17.9',
+    description: 'Acute kidney failure, unspecified',
+    billable: true,
+    label: 'Suggestion for clinician/coder review. Not a billing determination.',
+  });
+  ensureProblem('Elevated Pulse', null);
+  ensureProblem('community-acquired pneumonia', {
+    code: 'J18.9',
+    description: 'Pneumonia, unspecified organism',
+    billable: true,
+    label: 'Suggestion for clinician/coder review. Not a billing determination.',
+  });
+  const planDate = now.slice(0, 10);
+  const existingPlan = get('SELECT id, text FROM plans WHERE patient_id=? AND plan_date=? ORDER BY created_at DESC LIMIT 1', patientId, planDate);
+  if (!existingPlan || !String(existingPlan.text || '').includes('"version":1')) {
+    seedRosaStructuredPlan({ patientId, adminId: admin.id, now });
+  }
+  ensureElevatedPulseBank();
+  return { patientId };
 }
 
 function seedApprovedMcq({ adminId, topic, vignette, question, options, correctIndex, explanations, now }) {
@@ -121,11 +268,12 @@ export async function seedDemo() {
   seedTemplates();
   seedDemoIcdIfEmpty();
   seedExampleCheckRules();
-  // Existing DBs: drop identity leakage and backfill learning if the bank is empty.
+  // Existing DBs: drop identity leakage, backfill learning, ensure Rosa demo case.
   if (get('SELECT 1 AS x FROM users LIMIT 1')) {
     const purged = purgeIdentityFacts();
     if (purged) console.log(`Purged ${purged} identity fact(s) from existing demo DB.`);
     ensureElevatedPulseBank();
+    await ensureRosaDemoCase();
     return null;
   }
   const teamA = uid(); const teamB = uid();
@@ -192,63 +340,9 @@ export async function seedDemo() {
     );
   }
 
-  // Prefill a problem-organized Assessment and Plan for the complete demo path.
-  run(
-    'INSERT INTO plans(id,patient_id,plan_date,text,author_id,revision,created_at) VALUES(?,?,?,?,?,?,?)',
-    uid(),
-    patientId,
-    now.slice(0, 10),
-    [
-      'Community-acquired pneumonia — continue ceftriaxone and azithromycin; follow blood cultures',
-      'Acute kidney injury — hold nephrotoxins; recheck creatinine; assess volume status',
-      'Elevated Pulse — correlate with oxygen delivery and volume before attributing to fever alone',
-    ].join('\n'),
-    admin,
-    1,
-    now,
-  );
+  seedRosaStructuredPlan({ patientId, adminId: admin, now });
 
-  seedApprovedMcq({
-    adminId: admin,
-    topic: 'Elevated Pulse',
-    vignette: 'A 68-year-old woman with community-acquired pneumonia develops SpO2 88% on room air overnight and is placed on 2 L nasal cannula. Pulse is 112 bpm. Creatinine has risen from 0.9 to 1.8 mg/dL with low urine output.',
-    question: 'Which next bedside assessment best clarifies the tachycardia in this context?',
-    options: [
-      'Volume status and oxygen delivery before attributing tachycardia to infection alone',
-      'Immediate cardioversion for presumed unstable SVT',
-      'Stopping antibiotics to reduce drug fever',
-      'Ignoring pulse until blood cultures return',
-    ],
-    correctIndex: 0,
-    explanations: [
-      'Tachycardia with rising oxygen need and falling urine output warrants volume and gas-exchange assessment; the pulse is a clue, not a diagnosis.',
-      'Cardioversion is for unstable arrhythmia with clear criteria, not the first step from this vignette alone.',
-      'Antibiotics are treating pneumonia; stopping them is not indicated for this finding.',
-      'Pending cultures do not justify ignoring a new vital-sign change.',
-    ],
-    now,
-  });
-
-  seedApprovedMcq({
-    adminId: admin,
-    topic: 'Elevated Pulse',
-    vignette: 'Same patient: pulse 112 bpm on 2 L nasal cannula after overnight desaturation to SpO2 88% on room air. Blood pressure is stable.',
-    question: 'Which statement best reflects how to teach this finding on rounds?',
-    options: [
-      'Treat tachycardia as a sign to integrate gas exchange and volume, not a rhythm diagnosis by itself',
-      'Label SVT and cardiovert before examining the patient',
-      'Ignore until the discharge summary',
-      'Attribute solely to anxiety without vitals context',
-    ],
-    correctIndex: 0,
-    explanations: [
-      'Teaching should connect the pulse to oxygen delivery and volume using the documented facts.',
-      'Cardioversion without instability criteria is not supported by this vignette.',
-      'A new vital-sign change belongs in today’s assessment.',
-      'Anxiety is not documented; do not invent unsupported explanations.',
-    ],
-    now,
-  });
+  seedElevatedPulseMcqs({ adminId: admin, now });
 
   seedApprovedMcq({
     adminId: admin,

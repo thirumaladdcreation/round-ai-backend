@@ -7,6 +7,7 @@ import { matchedReminders, ackReminder } from '../check_rules.js';
 import { today as todayFn } from '../util.js';
 import { ensurePatientChannel } from '../chat.js';
 import { isIdentityFact } from '../ai/validators.js';
+import { buildStructuredFromBody, parsePlanRecord, planTextForContext } from '../plan.js';
 
 export function authorizeArtifact(user, id) {
   const row = get('SELECT * FROM artifacts WHERE id=?', id);
@@ -39,13 +40,28 @@ export function patientRoutes(r) {
   /* ---------- census ---------- */
   r.get('/patients', ({ user }) =>
     all(`SELECT p.* FROM patients p JOIN team_members m ON m.team_id=p.team_id WHERE m.user_id=?
-         ORDER BY CASE WHEN p.sort_order IS NULL THEN 1 ELSE 0 END, p.sort_order, p.room, p.display_name`, user.id).map((p) => ({
-      id: p.id, display_name: p.display_name, room: p.room, age_band: p.age_band, sex: p.sex, team_id: p.team_id,
-      sort_order: p.sort_order,
-      summary_state: summaryState(p.id), // AI never assigns urgency or ordering
-      unreviewed_facts: get("SELECT COUNT(*) AS n FROM facts WHERE patient_id=? AND reviewer_status='pending'", p.id).n,
-      open_tasks: get("SELECT COUNT(*) AS n FROM tasks WHERE patient_id=? AND state='open'", p.id).n,
-    })));
+         ORDER BY CASE WHEN p.sort_order IS NULL THEN 1 ELSE 0 END, p.sort_order, p.room, p.display_name`, user.id).map((p) => {
+      const problems = all(
+        "SELECT label FROM problems WHERE patient_id=? AND state IN ('confirmed','differential') ORDER BY created_at LIMIT 3",
+        p.id,
+      ).map((x) => x.label);
+      const ctx = buildContext(p);
+      const keyChanges = (ctx.trends || []).slice(0, 3).map((t) => t.text).filter(Boolean);
+      const oneLiner = [
+        p.age_band && p.sex ? `${p.age_band} ${p.sex}` : (p.age_band || p.sex || ''),
+        problems[0] ? `with ${problems[0]}` : '',
+      ].filter(Boolean).join(' ').trim();
+      return {
+        id: p.id, display_name: p.display_name, room: p.room, age_band: p.age_band, sex: p.sex, team_id: p.team_id,
+        sort_order: p.sort_order,
+        summary_state: summaryState(p.id), // AI never assigns urgency or ordering
+        unreviewed_facts: get("SELECT COUNT(*) AS n FROM facts WHERE patient_id=? AND reviewer_status='pending'", p.id).n,
+        open_tasks: get("SELECT COUNT(*) AS n FROM tasks WHERE patient_id=? AND state='open'", p.id).n,
+        one_liner: oneLiner || null,
+        key_changes: keyChanges,
+        active_problems: problems,
+      };
+    }));
 
   r.post('/patients', ({ user, body }) => {
     const teamId = str(body.team_id, 64);
@@ -94,18 +110,21 @@ export function patientRoutes(r) {
     const p = authorizePatient(user, params.id);
     audit(user.id, 'patient_view', { patient_id: p.id });
     const ctx = buildContext(p);
+    const problems = all(
+      "SELECT id,label,state,fact_ids,uncertainty,code_suggestion FROM problems WHERE patient_id=? AND state!='rejected' ORDER BY created_at",
+      p.id,
+    ).map((x) => ({
+      ...x,
+      fact_ids: jsonParse(x.fact_ids, []),
+      code_suggestion: jsonParse(x.code_suggestion, null),
+    }));
     return {
       id: p.id, display_name: p.display_name, room: p.room, age_band: p.age_band, sex: p.sex, sort_order: p.sort_order,
       revision: p.revision, last_reviewed_revision: p.last_reviewed_revision, summary_state: summaryState(p.id),
+      // Rendered plain text (ICD applied when include_icd was saved).
       plan_today: ctx.clinician_plan,
-      problems: all(
-        "SELECT id,label,state,fact_ids,uncertainty,code_suggestion FROM problems WHERE patient_id=? AND state!='rejected' ORDER BY created_at",
-        p.id,
-      ).map((x) => ({
-        ...x,
-        fact_ids: jsonParse(x.fact_ids, []),
-        code_suggestion: jsonParse(x.code_suggestion, null),
-      })),
+      plan_structured: ctx.clinician_plan?.structured || null,
+      problems,
       missing_information: ctx.missing_information, trends: ctx.trends, conflicts: ctx.conflicts,
       tasks: all("SELECT id,text,owner,due,state FROM tasks WHERE patient_id=? AND state IN ('proposed','open') ORDER BY created_at", p.id),
     };
@@ -204,21 +223,44 @@ export function patientRoutes(r) {
   /* ---------- plan ---------- */
   r.put('/patients/:id/plan', ({ user, params, body }) => {
     const p = authorizePatient(user, params.id);
-    // Accept `text`, or legacy `plan_today` as string / line list / { text }.
-    let text = str(body.text, 10000);
-    if (!text) {
-      const raw = body.plan_today;
-      if (typeof raw === 'string') text = str(raw, 10000);
-      else if (Array.isArray(raw)) text = str(raw.map((x) => String(x ?? '').trim()).filter(Boolean).join('\n'), 10000);
-      else if (raw && typeof raw === 'object') text = str(raw.text, 10000);
-    }
-    need(text, 400, 'text_required', 'text is required');
     const date = str(body.plan_date, 10) || today();
     need(isIsoDate(date), 400, 'bad_date', 'plan_date must be YYYY-MM-DD');
+    const problems = all(
+      "SELECT id,label,state,code_suggestion FROM problems WHERE patient_id=? AND state!='rejected'",
+      p.id,
+    ).map((x) => ({ ...x, code_suggestion: jsonParse(x.code_suggestion, null) }));
+
+    let storeText = '';
+    let rendered = '';
+    let structuredOut = null;
+    const fromItems = buildStructuredFromBody(body, { problems });
+    if (fromItems) {
+      storeText = fromItems.text;
+      rendered = fromItems.plain_text;
+      structuredOut = fromItems.structured;
+      need(fromItems.structured.items.length, 400, 'text_required', 'At least one Assessment and Plan item is required');
+    } else {
+      // Legacy: `text`, or `plan_today` as string / line list / { text }.
+      let text = str(body.text, 10000);
+      if (!text) {
+        const raw = body.plan_today;
+        if (typeof raw === 'string') text = str(raw, 10000);
+        else if (Array.isArray(raw)) text = str(raw.map((x) => String(x ?? '').trim()).filter(Boolean).join('\n'), 10000);
+        else if (raw && typeof raw === 'object') text = str(raw.text, 10000);
+      }
+      need(text, 400, 'text_required', 'text is required');
+      storeText = text;
+      rendered = text;
+    }
+
     const rev = bumpRevision(p.id);
-    run('INSERT INTO plans(id,patient_id,plan_date,text,author_id,revision,created_at) VALUES(?,?,?,?,?,?,?)', uid(), p.id, date, text, user.id, rev, nowIso());
-    audit(user.id, 'plan_save', { patient_id: p.id });
-    return { context_revision: rev };
+    run('INSERT INTO plans(id,patient_id,plan_date,text,author_id,revision,created_at) VALUES(?,?,?,?,?,?,?)', uid(), p.id, date, storeText, user.id, rev, nowIso());
+    audit(user.id, 'plan_save', { patient_id: p.id, detail: { structured: !!structuredOut } });
+    return {
+      context_revision: rev,
+      plan_today: { text: rendered, plan_date: date, include_icd: !!structuredOut?.include_icd },
+      plan_structured: structuredOut,
+    };
   });
 
   /* ---------- problems ---------- */
